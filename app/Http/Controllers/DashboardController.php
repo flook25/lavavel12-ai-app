@@ -1,13 +1,18 @@
 <?php
 namespace App\Http\Controllers;
 
+use App\Models\History;
 use Illuminate\Http\Request;
 use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
 use Inertia\Inertia;
+use Prism\Prism\Enums\ChunkType;
 use Prism\Prism\Exceptions\PrismException;
 use Prism\Prism\Prism;
 use Prism\Prism\Enums\Provider;
+use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Throwable;
 
 class DashboardController extends Controller
@@ -92,14 +97,35 @@ class DashboardController extends Controller
             $userText = $lastUser['content'] 
                         ?? collect(Arr::get($lastUser, 'parts', []))->where('type','text')->pluck('text')->implode('\n');
 
+            // 2. บันทึก message ไปยังตาราง historys (ภาพในสไลค์)
+            $currentUserId = Auth::user()->id;
+            History::create([
+                'user_id' => $currentUserId,
+                'role' => 'user',
+                'parts' => [
+                    ChunkType::Text->value => $userText
+                ]
+            ]);
+            
+            // 3. ดึงข้อมูล history จากตาราง แล้วส่งไปให้ LLM
+            // ระวังอย่าดึงข้อมูลเยอะจนเกินไป ควรใช้ limit ช่วย เพราะเปลือง token
+            // อย่าลืมลบ History เก่าที่ไม่ใช้แล้ว
+            $conversationHistory = History::where('user_id', $currentUserId)
+                                        ->limit(20)
+                                        ->orderBy('created_at')
+                                        ->get()
+                                        ->map(fn (History $history): UserMessage|AssistantMessage => match($history->role) {
+                                            'user' => new UserMessage(content: $message->parts['text'] ?? ''),
+                                            'assistant' => new AssistantMessage(content: $message->parts['text'] ?? ''),
+                                        })->toArray();
 
             /** @disregard [OPTIONAL CODE] [OPTIONAL DESCRIPTION] */
-            return response()->stream(function () use ($userText){
+            return response()->stream(function () use ($conversationHistory){
                $stream = Prism::text()
                 ->using(Provider::OpenAI, 'gpt-4.1-nano')
                 ->usingTemperature(0.2) // ถ้า gpt-4 จะปรับ temperature ได้ตามปกติ
                 ->withSystemPrompt('you are asistant for Laravel Framework')
-                ->withPrompt($userText)
+                ->withMessages($conversationHistory)
                 ->withClientRetry(3, 100)
                 ->withClientOptions(['timeout' => 60])
                 ->withProviderOptions([
